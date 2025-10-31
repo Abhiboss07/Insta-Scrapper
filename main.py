@@ -6,6 +6,7 @@ import os
 import time
 import logging
 import re
+import random
 from urllib.parse import urlparse
 import requests
 import pandas as pd
@@ -30,27 +31,36 @@ CX_IDS = [c.strip() for c in CX_IDS if c.strip()]
 INSTALOADER_SESSION_FILE = os.getenv("INSTALOADER_SESSION_FILE") or None
 MAX_FOLLOWERS = 100000
 
-# Track queries per API key
-current_key_index = 0
+# Track queries per API key with random selection
 queries_per_key = {}
+failed_keys = set()  # Track keys that hit rate limits
+MAX_QUERIES_PER_KEY = 95
 
-def get_current_api_credentials():
-    """Rotate through available API keys"""
-    global current_key_index
+def get_random_api_credentials():
+    """Randomly select an available API key for better load balancing"""
+    global queries_per_key, failed_keys
     
     if not API_KEYS or not CX_IDS:
-        return None, None
+        return None, None, None
     
-    # Rotate if current key has been used too much (95 queries)
-    if queries_per_key.get(current_key_index, 0) >= 95:
-        current_key_index = (current_key_index + 1) % len(API_KEYS)
-        logging.info(f"Rotating to API key #{current_key_index + 1}")
-        print(f"🔄 Switching to API key #{current_key_index + 1}")
+    # Get available keys (not exhausted or failed)
+    available_indices = [
+        i for i in range(len(API_KEYS))
+        if i not in failed_keys and queries_per_key.get(i, 0) < MAX_QUERIES_PER_KEY
+    ]
     
-    api_key = API_KEYS[current_key_index]
-    cx = CX_IDS[min(current_key_index, len(CX_IDS) - 1)]  # Use last CX if fewer CX than keys
+    if not available_indices:
+        logging.warning("All API keys exhausted or failed")
+        return None, None, None
     
-    return api_key, cx
+    # Weighted random selection - prefer keys with fewer queries
+    weights = [MAX_QUERIES_PER_KEY - queries_per_key.get(i, 0) for i in available_indices]
+    selected_index = random.choices(available_indices, weights=weights, k=1)[0]
+    
+    api_key = API_KEYS[selected_index]
+    cx = CX_IDS[min(selected_index, len(CX_IDS) - 1)]
+    
+    return api_key, cx, selected_index
 
 def extract_username(url):
     try:
@@ -64,10 +74,10 @@ def extract_username(url):
         return None
     return None
 
-def google_search(query, start=1):
-    global current_key_index, queries_per_key
+def google_search(query, start=1, retry=True):
+    global queries_per_key, failed_keys
     
-    api_key, cx = get_current_api_credentials()
+    api_key, cx, key_index = get_random_api_credentials()
     if not api_key or not cx:
         logging.error("No valid API credentials available")
         return []
@@ -76,23 +86,24 @@ def google_search(query, start=1):
     params = {"q": query, "key": api_key, "cx": cx, "start": start}
     
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, params=params, timeout=10)  # Reduced timeout for faster fails
         r.raise_for_status()
         data = r.json()
         
         # Track successful query
-        queries_per_key[current_key_index] = queries_per_key.get(current_key_index, 0) + 1
+        queries_per_key[key_index] = queries_per_key.get(key_index, 0) + 1
         
         return data.get("items", [])
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 429:
-            logging.warning(f"API key #{current_key_index + 1} hit rate limit")
+            logging.warning(f"API key #{key_index + 1} hit rate limit")
             # Mark this key as exhausted
-            queries_per_key[current_key_index] = 95
-            # Try with next key
-            current_key_index = (current_key_index + 1) % len(API_KEYS)
-            if queries_per_key.get(current_key_index, 0) < 95:
-                return google_search(query, start)
+            queries_per_key[key_index] = MAX_QUERIES_PER_KEY
+            failed_keys.add(key_index)
+            # Retry with different key
+            if retry and len(failed_keys) < len(API_KEYS):
+                time.sleep(0.2)  # Brief pause before retry
+                return google_search(query, start, retry=False)
         logging.error(f"Google API error for query={query} start={start}: {e}")
         return []
     except Exception as e:
@@ -126,7 +137,7 @@ def collect_instagram_links(profession, location="India", max_results=50):
                             "username": username,
                             "profession": profession
                         })
-            time.sleep(0.5)
+            time.sleep(0.3)  # Optimized delay - faster but safe
     
     unique = {x["username"]: x for x in found}
     return list(unique.values())
@@ -174,7 +185,7 @@ def enrich_with_instaloader(entries, use_instaloader=True):
         except Exception as ex:
             logging.warning(f"Instaloader failed for {username}: {ex}")
         enriched.append(profile_data)
-        time.sleep(1)
+        time.sleep(0.7)  # Reduced Instagram delay for faster scraping
     return enriched
 
 def filter_entries(entries):
@@ -217,9 +228,10 @@ def main():
         return
 
     print(f"\n{'='*60}")
-    print(f"🚀 MULTI-KEY INSTAGRAM LEAD GENERATOR")
+    print(f"🚀 OPTIMIZED INSTAGRAM LEAD GENERATOR")
     print(f"Available API Keys: {len(API_KEYS)}")
-    print(f"Estimated Capacity: {len(API_KEYS) * 95} queries")
+    print(f"Total Capacity: {len(API_KEYS) * MAX_QUERIES_PER_KEY} queries")
+    print(f"Strategy: Random API selection for optimal load balancing")
     print(f"{'='*60}\n")
 
     profession_keywords = {
@@ -250,17 +262,24 @@ def main():
                     print(f"  -> {len(filtered)} profiles passed filters")
                     all_found.extend(filtered)
                     
-                time.sleep(1)
+                time.sleep(0.5)  # Optimized delay between searches
     
     unique = {x["username"]: x for x in all_found}
     final = list(unique.values())
     
     total_queries = sum(queries_per_key.values())
+    remaining = (len(API_KEYS) * MAX_QUERIES_PER_KEY) - total_queries
+    
     print(f"\n{'='*60}")
     print(f"✅ TOTAL PROFILES FOUND: {len(final)}")
-    print(f"📊 Total API Queries Used: {total_queries}")
-    for idx, count in queries_per_key.items():
-        print(f"   API Key #{idx + 1}: {count} queries")
+    print(f"📊 API Usage Statistics:")
+    print(f"   Total Queries: {total_queries}")
+    print(f"   Remaining Capacity: {remaining} queries")
+    print(f"   \nPer Key Usage:")
+    for idx in sorted(queries_per_key.keys()):
+        count = queries_per_key[idx]
+        status = "🔴 Exhausted" if idx in failed_keys else f"🟢 Active ({MAX_QUERIES_PER_KEY - count} left)"
+        print(f"   API Key #{idx + 1}: {count} queries {status}")
     print(f"{'='*60}")
     
     save_csv(final)
